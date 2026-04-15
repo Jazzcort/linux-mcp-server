@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import os
 import sys
 
@@ -41,12 +42,14 @@ def run_test_file(test_case_file: str, label: str | None = None) -> tuple[list[d
 
     with typer.progressbar(test_cases, label=f"Running {label}") as progress:
         for test_case in progress:
+            id = test_case["id"]
             description = test_case["description"]
             script_type = test_case["script_type"]
             script = test_case["script"]
             readonly = test_case.get("readonly", False)
 
             result = {
+                "id": id,
                 "description": description,
                 "script_type": script_type,
                 "script": script,
@@ -73,7 +76,7 @@ def run_test_file(test_case_file: str, label: str | None = None) -> tuple[list[d
     return test_cases, results
 
 
-def build_output_cases(test_cases: list[dict], results: list[dict]) -> list[dict]:
+def build_output_cases(test_cases: list[dict], results: list[dict], *, output_all: bool = False) -> list[dict]:
     """Build output cases, filtering to only non-same results and adding expected_result."""
     output_cases = []
     for test_case, result in zip(test_cases, results):
@@ -86,10 +89,12 @@ def build_output_cases(test_cases: list[dict], results: list[dict]) -> list[dict
             and actual is not None
             and "exception" not in actual
             and expected.get("status") == actual.get("status")
+            and not output_all
         ):
             continue
 
         output = {
+            "id": result["id"],
             "description": result["description"],
             "script_type": result["script_type"],
             "script": result["script"],
@@ -175,6 +180,20 @@ def main(
     output_file: Annotated[
         str | None, typer.Option("--output-file", "-o", help="Path to the output file to write results.")
     ] = None,
+    output_all: Annotated[
+        bool,
+        typer.Option(
+            "--output-all",
+            help="Output all the test results including the case that the actual result matches the expected result.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Change the output file format to json.",
+        ),
+    ] = False,
 ):
     """
     Run a set of test cases through the gatekeeper, and report results.
@@ -218,7 +237,7 @@ def main(
             test_cases, results = run_test_file(str(tc_file), label=rel_path)
             summary = compute_summary(test_cases, results)
             file_summaries.append((rel_path, summary))
-            all_output_cases.extend(build_output_cases(test_cases, results))
+            all_output_cases.extend(build_output_cases(test_cases, results, output_all=output_all))
 
         # Build combined summary
         combined_summary = {"same": 0, "ok_to_forbidden": 0, "forbidden_to_ok": 0, "other_mismatch": 0, "exception": 0}
@@ -227,32 +246,40 @@ def main(
                 combined_summary[k] += s[k]
 
         output = {"summary": combined_summary, "cases": all_output_cases}
-        yaml_output = yaml.dump(output, indent=2, sort_keys=False, Dumper=BlockStyleDumper)
+
+        if json_output:
+            output_string = json.dumps(output, indent=2)
+        else:
+            output_string = yaml.dump(output, indent=2, sort_keys=False, Dumper=BlockStyleDumper)
 
         if output_file:
             with open(output_file, "w") as f:
-                f.write(yaml_output)
+                f.write(output_string)
             typer.echo(f"Wrote {len(all_output_cases)} results to {output_file}")
             print_summary_table(file_summaries, file=sys.stdout)
         else:
-            sys.stdout.write(yaml_output)
+            sys.stdout.write(output_string)
             print_summary_table(file_summaries, file=sys.stderr)
     else:
         assert test_case_file is not None
 
         test_cases, results = run_test_file(test_case_file)
         summary = compute_summary(test_cases, results)
-        output_cases = build_output_cases(test_cases, results)
+        output_cases = build_output_cases(test_cases, results, output_all=output_all)
 
         output = {"summary": summary, "cases": output_cases}
-        yaml_output = yaml.dump(output, indent=2, sort_keys=False, Dumper=BlockStyleDumper)
+
+        if json_output:
+            output_string = json.dumps(output, indent=2)
+        else:
+            output_string = yaml.dump(output, indent=2, sort_keys=False, Dumper=BlockStyleDumper)
 
         if output_file:
             with open(output_file, "w") as f:
-                f.write(yaml_output)
+                f.write(output_string)
             typer.echo(f"Wrote {len(output_cases)} results to {output_file}")
         else:
-            sys.stdout.write(yaml_output)
+            sys.stdout.write(output_string)
 
 
 if __name__ == "__main__":

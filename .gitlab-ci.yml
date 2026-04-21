@@ -5,6 +5,15 @@
 #   GITLAB_TOKEN - Personal/Project Access Token with 'write_repository' scope
 #                  Configure at: Settings > CI/CD > Variables (Protected + Masked)
 
+spec:
+  inputs:
+    workflow:
+      options: ["mirror", "eval"]
+      default: "mirror"
+      description: "Workflow to run"
+
+---
+
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "web"
@@ -18,6 +27,9 @@ variables:
     description: "GitHub commit SHA to fetch"
 
 stages:
+  - setup
+  - eval
+  - post-eval
   - mirror
 
 mirror-github-pr:
@@ -29,3 +41,140 @@ mirror-github-pr:
     - python3 scripts/mirror_github_pr.py
   rules:
     - if: $GITHUB_PR_NUMBER && $GITHUB_COMMIT_SHA
+
+setup-uv-and-mcp-apps:
+  stage: setup
+  image: images.paas.redhat.com/it-cloud-ocp-proxy-lib/python:3.14
+  tags:
+    - rhel-lightspeed
+  variables:
+    HOME: "$CI_PROJECT_DIR"
+  script:
+    # Install uv
+    - export PYTHONUSERBASE=$CI_PROJECT_DIR/.local
+    - pip install --user uv
+
+    # Install nvm to set up node and npm
+    - curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash
+    - \. "$HOME/.nvm/nvm.sh"
+    - nvm install 24
+
+    # Generate the bundled html file
+    - cd mcp-app && npm install && npm run build:prod
+  artifacts:
+    paths:
+      - .local/
+      - mcp-app/dist/
+    expire_in: 1 hour
+  rules:
+    - if: '"$[[ inputs.workflow ]]" == "eval"'
+
+
+gatekeeper-eval-claude-4.6-opus:
+  stage: eval
+  image: images.paas.redhat.com/it-cloud-ocp-proxy-lib/python:3.14
+  variables:
+    MODEL_NAME: "claude-4.6-opus"
+  tags:
+    - rhel-lightspeed
+  needs:
+    - job: setup-uv-and-mcp-apps
+      artifacts: true
+  script:
+    # Install dependencies
+    - export PATH="$CI_PROJECT_DIR/.local/bin:$PATH"
+    - uv sync --locked
+
+    # Run eval and save it to data/
+    - mkdir "$CI_PROJECT_DIR/data"
+    - export LINUX_MCP_GATEKEEPER_MODEL="openrouter/anthropic/$MODEL_NAME"
+    - uv run eval/gatekeeper/run-eval.py --all --json --output-all -o "$CI_PROJECT_DIR/data/$MODEL_NAME.json"
+  artifacts:
+    paths: 
+      - data/
+    expire_in: 1 hour
+  rules:
+    - if: $OPENROUTER_API_KEY && '"$[[ inputs.workflow ]]" == "eval"'
+
+gatekeeper-eval-models-corp-gemini:
+  stage: eval
+  image: images.paas.redhat.com/it-cloud-ocp-proxy-lib/python:3.14
+  variables:
+    MODEL_NAME: "gemini-3.1-pro-preview"
+  tags:
+    - rhel-lightspeed
+  needs:
+    - job: setup-uv-and-mcp-apps
+      artifacts: true
+  script:
+    # Install dependencies
+    - export PATH="$CI_PROJECT_DIR/.local/bin:$PATH"
+    - uv sync --locked
+
+    # Download certificate for using the internal Red Hat model platform
+    - curl -o "$CI_PROJECT_DIR/cert.pem" https://certs.corp.redhat.com/certs/2022-IT-Root-CA.pem
+    - export SSL_CERT_FILE="$CI_PROJECT_DIR/cert.pem"
+
+    # Run eval and save it to data/
+    - mkdir "$CI_PROJECT_DIR/data"
+    - export OPENAI_API_KEY="$MODELS_CORP_GEMINI_API_KEY"
+    - export MODEL="$MODEL_NAME"
+    - ./eval/gatekeeper/run-eval-models-corp.sh --all --json --output-all -o "$CI_PROJECT_DIR/data/$MODEL_NAME.json"
+  artifacts:
+    paths: 
+      - data/
+    expire_in: 1 hour
+  rules:
+    - if: $MODELS_CORP_GEMINI_API_KEY && '"$[[ inputs.workflow ]]" == "eval"'
+
+gatekeeper-eval-models-corp-gpt-oss-20b:
+  stage: eval
+  image: images.paas.redhat.com/it-cloud-ocp-proxy-lib/python:3.14
+  variables:
+    MODEL_NAME: "gpt-oss-20b"
+  tags:
+    - rhel-lightspeed
+  needs:
+    - job: setup-uv-and-mcp-apps
+      artifacts: true
+  script:
+    # Install dependencies
+    - export PATH="$CI_PROJECT_DIR/.local/bin:$PATH"
+    - uv sync --locked
+
+    # Download certificate for using the internal Red Hat model platform
+    - curl -o "$CI_PROJECT_DIR/cert.pem" https://certs.corp.redhat.com/certs/2022-IT-Root-CA.pem
+    - export SSL_CERT_FILE="$CI_PROJECT_DIR/cert.pem"
+    
+    # Run eval and save it to data/
+    - mkdir "$CI_PROJECT_DIR/data"
+    - export OPENAI_API_KEY="$MODELS_CORP_GPT_OSS_20B_API_KEY"
+    - export MODEL="openai/$MODEL_NAME"
+    - ./eval/gatekeeper/run-eval-models-corp.sh --all --json --output-all -o "$CI_PROJECT_DIR/data/$MODEL_NAME.json"
+  artifacts:
+    paths: 
+      - data/
+    expire_in: 1 hour
+  rules:
+    - if: $MODELS_CORP_GPT_OSS_20B_API_KEY && '"$[[ inputs.workflow ]]" == "eval"'
+
+post-eval-result:
+  stage: post-eval
+  image: images.paas.redhat.com/it-cloud-ocp-proxy-lib/bash
+  tags:
+    - rhel-lightspeed
+  script:
+    # Copy index.html to the project root so we have the correct structure for rendering
+    - cp eval/gatekeeper/index.html "$CI_PROJECT_DIR/index.html"
+    # Create the manifest file for the rendering app to correctly gather the data
+    - ls data/*.json | xargs -n1 basename > data/manifest.txt
+  artifacts:
+    paths:
+      - data/
+      - index.html
+  rules:
+    - if: '"$[[ inputs.workflow ]]" == "eval"'
+
+
+
+
